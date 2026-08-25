@@ -1,0 +1,22 @@
+# =============================================================================
+# CodeMender Google Cloud Workload Identity Federation (WIF) Configuration
+# =============================================================================
+# Copy this file to terraform.tfvars and update the values for your project:
+#   cp terraform.tfvars.example terraform.tfvars
+# =============================================================================
+
+# REQUIRED: Google Cloud Project ID hosting CodeMender Vertex AI models.
+project_id = "my-gcp-project-id"
+
+# REQUIRED: Target GitHub repository in "owner/repo" format.
+github_repo = "my-org/my-target-repo"
+
+# OPTIONAL: Workload Identity Pool configuration (defaults shown below).
+# pool_id               = "codemender-pool"
+# pool_display_name     = "CodeMender Identity Pool"
+# provider_id           = "codemender-provider"
+# provider_display_name = "CodeMender GitHub Provider"
+
+# OPTIONAL: Service Account configuration (defaults shown below).
+# sa_name               = "codemender-runner"
+# sa_display_name       = "CodeMender Runner"

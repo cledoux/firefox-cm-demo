@@ -1,0 +1,219 @@
+# CodeMender Pull Request Security Review & Automated Remediation Workflow
+#
+# Architecture & Design References:
+# - Capability Spec: openspec/specs/workflow/cm-pr-workflow/spec.md
+# - Architectural Design: openspec/specs/workflow/cm-pr-workflow/design.md
+# - Governing ADRs:
+#   - ADR-0001: Headless Batch Scanner Execution
+#   - ADR-0002: Exact Subcommand Routing
+#   - ADR-0003: Ephemeral OverlayFS Workspace Isolation
+#   - ADR-0004: Container Execution Mode & Sandbox Isolation Trade-offs
+#   - ADR-0005: Stateless Fix Runner Protocol
+#   - ADR-0006: Lightweight Declarative Matrix Partitioning via jq
+#   - ADR-0007: Native Diff-Aware Vulnerability Scanning Protocol (find-diff)
+#
+# Requirements & Configuration:
+# - Required GitHub Repository Secrets:
+#   - GCP_WIF_PROVIDER: Full resource path of GCP Workload Identity Provider
+#   - GCP_SERVICE_ACCOUNT: Service Account email with roles/aiplatform.user
+# - Required Permissions:
+#   - contents: read (inspect source tree and commit history)
+#   - id-token: write (exchange GitHub OIDC token with GCP STS)
+#   - pull-requests: write (post inline review comments and PR summaries)
+#
+# Pipeline Lifecycle:
+# 1. scan: Runs native diff-aware scanner (find-diff), traps exit code, and
+#    outputs dynamic findings matrix partitioned by severity and max limit.
+# 2. fix: Concurrently remediates findings via cm-runner fix with FUSE isolation
+#    and publishes inline 1-click apply review suggestions.
+
+name: "CodeMender PR Review"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+  packages: read
+  pull-requests: write
+
+jobs:
+  scan:
+    name: "Scan PR Diff for Vulnerabilities"
+    runs-on: ubuntu-latest
+    outputs:
+      has_findings: ${{ steps.scan.outputs.has_findings }}
+      findings_matrix: ${{ steps.scan.outputs.findings_matrix }}
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Fetch base revision"
+        run: |
+          git fetch origin "${{ github.event.pull_request.base.sha }}" || git fetch origin "${{ github.base_ref }}"
+
+      - name: "Log in to GitHub Container Registry"
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: "Authenticate to Google Cloud via WIF"
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: "Run CodeMender Batch Scanner"
+        id: scan
+        run: |
+          mkdir -p .codemender-out
+
+          # Execute scanner with exit code trapping
+          set +e
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$(pwd):/workspace" \
+            -v "${GOOGLE_APPLICATION_CREDENTIALS}:/tmp/gcp_creds.json:ro" \
+            -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_creds.json \
+            -e GOOGLE_CLOUD_PROJECT="${CLOUDSDK_CORE_PROJECT:-${GOOGLE_CLOUD_PROJECT:-}}" \
+            -e CLOUDSDK_CORE_PROJECT="${CLOUDSDK_CORE_PROJECT:-${GOOGLE_CLOUD_PROJECT:-}}" \
+            -e NO_COLOR=1 \
+            -e TERM=dumb \
+            ghcr.io/cledoux/firefox-cm-demo/cm-runner:latest find-diff "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" > .codemender-out/findings.json
+          SCAN_EXIT_CODE=$?
+          set -e
+
+          if [ "$SCAN_EXIT_CODE" -eq 0 ]; then
+            echo "Clean scan: 0 vulnerabilities found."
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+            echo "findings_matrix=[]" >> "$GITHUB_OUTPUT"
+          elif [ "$SCAN_EXIT_CODE" -eq 1 ]; then
+            echo "Vulnerabilities detected. Generating dynamic fix matrix..."
+
+            # Extract pull request diff for finding scope classification
+            git diff "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" > .codemender-out/commit.diff || true
+
+            # Resolve script locations (installed repo vs source repo)
+            FILTER_SCRIPT="github-actions/scripts/filter_findings.jq"
+            if [ -f ".github/scripts/filter_findings.jq" ]; then
+              FILTER_SCRIPT=".github/scripts/filter_findings.jq"
+            fi
+            PUBLISH_SCRIPT="github-actions/scripts/publish_comments.py"
+            if [ -f ".github/scripts/publish_comments.py" ]; then
+              PUBLISH_SCRIPT=".github/scripts/publish_comments.py"
+            fi
+
+            # 1. In-diff actionable findings for parallel fix matrix
+            MATRIX_JSON=$(jq -c --rawfile diff .codemender-out/commit.diff --arg mode in_diff -f "$FILTER_SCRIPT" .codemender-out/findings.json)
+            if [ -z "$MATRIX_JSON" ] || [ "$MATRIX_JSON" = "null" ] || [ "$MATRIX_JSON" = "[]" ]; then
+              echo "No actionable findings intersect with modified PR lines."
+              echo "has_findings=false" >> "$GITHUB_OUTPUT"
+              echo "findings_matrix=[]" >> "$GITHUB_OUTPUT"
+            else
+              echo "Partitioned in-diff findings matrix: $MATRIX_JSON"
+              echo "has_findings=true" >> "$GITHUB_OUTPUT"
+              echo "findings_matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
+            fi
+
+            # 2. Out-of-diff potentially preexisting advisory findings
+            PREEXISTING_JSON=$(jq -c --rawfile diff .codemender-out/commit.diff --arg mode preexisting -f "$FILTER_SCRIPT" .codemender-out/findings.json)
+            if [ -n "$PREEXISTING_JSON" ] && [ "$PREEXISTING_JSON" != "null" ] && [ "$PREEXISTING_JSON" != "[]" ]; then
+              echo "Found potentially preexisting findings outside PR diff. Publishing non-blocking advisory..."
+              echo "$PREEXISTING_JSON" > .codemender-out/preexisting_findings.json
+              GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}" \
+              GITHUB_REPOSITORY="${{ github.repository }}" \
+              PR_NUMBER="${{ github.event.pull_request.number }}" \
+              COMMIT_SHA="${{ github.event.pull_request.head.sha }}" \
+              GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY}" \
+              python3 "$PUBLISH_SCRIPT" --advisory .codemender-out/preexisting_findings.json || true
+            fi
+          else
+            echo "::error::CodeMender scanner failed with exit code $SCAN_EXIT_CODE"
+            cat .codemender-out/findings.json >&2 || true
+            exit "$SCAN_EXIT_CODE"
+          fi
+
+  fix:
+    name: "Fix Finding: ${{ matrix.finding.title }}"
+    runs-on: ubuntu-latest
+    needs: scan
+    if: needs.scan.outputs.has_findings == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        finding: ${{ fromJson(needs.scan.outputs.findings_matrix) }}
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Fetch base revision"
+        run: |
+          git fetch origin "${{ github.event.pull_request.base.sha }}" || git fetch origin "${{ github.base_ref }}"
+
+      - name: "Log in to GitHub Container Registry"
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: "Authenticate to Google Cloud via WIF"
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: "Remediate finding via CodeMender Fix Runner"
+        id: fix
+        env:
+          FINDING_PAYLOAD: ${{ toJson(matrix.finding.payload) }}
+        run: |
+          mkdir -p .codemender-out
+          printf '%s\n' "$FINDING_PAYLOAD" > .codemender-out/finding.json
+
+          set +e
+          cat .codemender-out/finding.json | docker run --rm -i \
+            --user "$(id -u):$(id -g)" \
+            -v "$(pwd):/workspace" \
+            -v "${GOOGLE_APPLICATION_CREDENTIALS}:/tmp/gcp_creds.json:ro" \
+            -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_creds.json \
+            -e GOOGLE_CLOUD_PROJECT="${CLOUDSDK_CORE_PROJECT:-${GOOGLE_CLOUD_PROJECT:-}}" \
+            -e CLOUDSDK_CORE_PROJECT="${CLOUDSDK_CORE_PROJECT:-${GOOGLE_CLOUD_PROJECT:-}}" \
+            -e NO_COLOR=1 \
+            -e TERM=dumb \
+            ghcr.io/cledoux/firefox-cm-demo/cm-runner:latest fix - > change_envelope.json
+
+          FIX_EXIT_CODE=$?
+          set -e
+
+          if [ "$FIX_EXIT_CODE" -eq 0 ]; then
+            echo "Successfully generated fix patch (FIXED)."
+          elif [ "$FIX_EXIT_CODE" -eq 1 ]; then
+            echo "Finding could not be automatically resolved (UNRESOLVED)."
+          else
+            echo "::error::CodeMender fix runner encountered a fatal error ($FIX_EXIT_CODE)"
+            exit "$FIX_EXIT_CODE"
+          fi
+
+      - name: "Publish Review Suggestions & Status"
+        if: always() && steps.fix.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          PUBLISH_SCRIPT="github-actions/scripts/publish_comments.py"
+          if [ -f ".github/scripts/publish_comments.py" ]; then
+            PUBLISH_SCRIPT=".github/scripts/publish_comments.py"
+          fi
+
+          if [ -f "change_envelope.json" ]; then
+            python3 "$PUBLISH_SCRIPT" change_envelope.json
+          else
+            echo "No change envelope generated to publish."
+          fi
